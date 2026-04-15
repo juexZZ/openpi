@@ -168,6 +168,8 @@ class PI0Pytorch(nn.Module):
             observation.tokenized_prompt,
             observation.tokenized_prompt_mask,
             observation.state,
+            getattr(observation, "token_ar_mask", None),
+            getattr(observation, "token_loss_mask", None),
         )
 
     def sample_noise(self, shape, device):
@@ -185,14 +187,19 @@ class PI0Pytorch(nn.Module):
         return time.to(dtype=torch.float32, device=device)
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks
+        self, images, img_masks, lang_tokens, lang_masks, token_ar_mask=None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
+
+        If `token_ar_mask` is provided ([B, L]), it is used as the per-sample attention-regime mask
+        for the language-token region (0 = bidirectional prefix, 1 = causal action token). This is
+        needed when FAST-tokenized action targets are appended to the language prefix for the
+        pi0.5 discrete action token loss.
         """
         embs = []
         pad_masks = []
-        att_masks = []
+        num_img_total = 0
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
@@ -206,9 +213,7 @@ class PI0Pytorch(nn.Module):
 
             embs.append(img_emb)
             pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
-
-            # Create attention masks so that image tokens attend to each other
-            att_masks += [0] * num_img_embs
+            num_img_total += num_img_embs
 
         # Process language tokens
         def lang_embed_func(lang_tokens):
@@ -220,18 +225,22 @@ class PI0Pytorch(nn.Module):
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
-
-        # full attention between image and language inputs
         num_lang_embs = lang_emb.shape[1]
-        att_masks += [0] * num_lang_embs
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
 
-        # Get batch size from the first dimension of the concatenated tensors
         bsize = pad_masks.shape[0]
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        device = pad_masks.device
+
+        # Build per-sample attention-regime mask: images always bidirectional (0); language region
+        # follows token_ar_mask when provided, otherwise all-zero (original pi0 / pi0.5 behavior).
+        img_att = torch.zeros(bsize, num_img_total, dtype=torch.long, device=device)
+        if token_ar_mask is not None:
+            lang_att = token_ar_mask.to(dtype=torch.long, device=device)
+        else:
+            lang_att = torch.zeros(bsize, num_lang_embs, dtype=torch.long, device=device)
+        att_masks = torch.cat([img_att, lang_att], dim=1)
 
         return embs, pad_masks, att_masks
 
@@ -309,14 +318,26 @@ class PI0Pytorch(nn.Module):
 
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
-        att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
-        att_masks = att_masks[None, :].expand(bsize, len(att_masks))
+        att_masks_t = torch.tensor(att_masks, dtype=torch.long, device=embs.device)
+        att_masks_t = att_masks_t[None, :].expand(bsize, len(att_masks))
 
-        return embs, pad_masks, att_masks, adarms_cond
+        return embs, pad_masks, att_masks_t, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
-        """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+    def forward(self, observation, actions, noise=None, time=None):
+        """Training forward pass. Returns MSE loss [B, H, A] (original behavior) or, when the
+        pi0.5 discrete action token loss is enabled, a dict with {'mse', 'ce', 'total'}.
+        """
+        (
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            token_ar_mask,
+            token_loss_mask,
+        ) = self._preprocess_observation(observation, train=True)
+
+        use_discrete = bool(getattr(self.config, "pi05_discrete_action_loss", False))
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
@@ -328,7 +349,10 @@ class PI0Pytorch(nn.Module):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks,
+            token_ar_mask=token_ar_mask if use_discrete else None,
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
@@ -346,32 +370,68 @@ class PI0Pytorch(nn.Module):
         # Prepare attention masks
         att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
+        # Plumb stop-grad when the discrete action token loss is active. The action expert must not
+        # leak gradients into the LLM via cross-stream attention; see pi0.5 paper.
+        prefix_len = prefix_embs.shape[1]
+        sg_prefix_len = prefix_len if use_discrete else None
+
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
-            (_, suffix_out), _ = self.paligemma_with_expert.forward(
+            (prefix_out, suffix_out), _ = self.paligemma_with_expert.forward(
                 attention_mask=att_2d_masks_4d,
                 position_ids=position_ids,
                 past_key_values=None,
                 inputs_embeds=[prefix_embs, suffix_embs],
                 use_cache=False,
                 adarms_cond=[None, adarms_cond],
+                stop_grad_prefix_len=sg_prefix_len,
             )
-            return suffix_out
+            return prefix_out, suffix_out
 
-        suffix_out = self._apply_checkpoint(
+        prefix_out, suffix_out = self._apply_checkpoint(
             forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
         )
 
-        suffix_out = suffix_out[:, -self.config.action_horizon :]
-        suffix_out = suffix_out.to(dtype=torch.float32)
+        suffix_out_last = suffix_out[:, -self.config.action_horizon :]
+        suffix_out_last = suffix_out_last.to(dtype=torch.float32)
 
         # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
+        def action_out_proj_func(suffix_out_last):
+            return self.action_out_proj(suffix_out_last)
 
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out_last)
 
-        return F.mse_loss(u_t, v_t, reduction="none")
+        mse_loss = F.mse_loss(u_t, v_t, reduction="none")
+
+        if not use_discrete:
+            return mse_loss
+
+        # --- Auxiliary CE loss on FAST-tokenized action targets (pi0.5 discrete loss) ---
+        # Language-token hidden states live at the end of the prefix stream.
+        num_lang = lang_tokens.shape[1]
+        lang_hidden = prefix_out[:, -num_lang:, :].to(torch.float32)
+
+        # Use tied embedding weights as the LM head (PaliGemma ties by default).
+        embed_weight = self.paligemma_with_expert.paligemma.language_model.embed_tokens.weight
+        logits = F.linear(lang_hidden.to(embed_weight.dtype), embed_weight).to(torch.float32)
+
+        # Teacher forcing: input[:, :-1] predicts targets[:, 1:]
+        logits_shift = logits[:, :-1, :]
+        targets = lang_tokens[:, 1:].to(torch.long)
+        if token_loss_mask is None:
+            raise ValueError("pi05_discrete_action_loss requires token_loss_mask in the observation.")
+        loss_mask = token_loss_mask[:, 1:].to(torch.float32)
+
+        ce_per_token = F.cross_entropy(
+            logits_shift.reshape(-1, logits_shift.shape[-1]),
+            targets.reshape(-1),
+            reduction="none",
+        ).reshape(targets.shape)
+        denom = loss_mask.sum().clamp_min(1.0)
+        ce_loss = (ce_per_token * loss_mask).sum() / denom
+
+        total_loss = mse_loss.mean() + self.config.pi05_discrete_loss_weight * ce_loss
+        return {"mse": mse_loss, "ce": ce_loss, "total": total_loss}
 
     @torch.no_grad()
     def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:

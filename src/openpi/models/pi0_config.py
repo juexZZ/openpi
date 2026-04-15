@@ -32,11 +32,23 @@ class Pi0Config(_model.BaseModelConfig):
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
 
+    # Pi0.5 paper auxiliary discrete action token loss.
+    # When True, FAST-tokenized action targets are appended to the language prefix and trained with
+    # a cross-entropy loss alongside the flow-matching MSE. The action expert is stop-gradded from the
+    # LLM's KV so MSE gradients do not reach the LLM; only the CE loss trains the LLM. PyTorch-only.
+    pi05_discrete_action_loss: bool = False
+    pi05_discrete_loss_weight: float = 0.1
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
         if self.max_token_len is None:
-            object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)
+            if self.pi05:
+                object.__setattr__(self, "max_token_len", 280 if self.pi05_discrete_action_loss else 200)
+            else:
+                object.__setattr__(self, "max_token_len", 48)
+        if self.pi05_discrete_action_loss and not self.pi05:
+            raise ValueError("pi05_discrete_action_loss requires pi05=True")
         if self.discrete_state_input is None:
             object.__setattr__(self, "discrete_state_input", self.pi05)
         if self.pytorch_compile_mode is not None:

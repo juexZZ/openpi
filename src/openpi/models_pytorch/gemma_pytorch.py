@@ -96,6 +96,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        stop_grad_prefix_len: int | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -196,16 +197,50 @@ class PaliGemmaWithExpertModel(nn.Module):
 
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
+                llm_self_attn = self.paligemma.language_model.layers[layer_idx].self_attn
 
-                # Attention computation
-                att_output, _ = modeling_gemma.eager_attention_forward(
-                    self.paligemma.language_model.layers[layer_idx].self_attn,
-                    query_states,
-                    key_states,
-                    value_states,
-                    attention_mask,
-                    scaling,
-                )
+                # Attention computation.
+                # When `stop_grad_prefix_len` is set, split the joint attention into two calls
+                # so that suffix (action-expert) queries see a detached copy of the prefix (LLM)
+                # K/V, while prefix queries still propagate gradients through their own K/V.
+                # This implements the pi0.5 paper's stop-gradient between the action expert and
+                # the language model, without leaking MSE gradients back into the LLM.
+                if stop_grad_prefix_len is not None:
+                    P = stop_grad_prefix_len
+                    # query/key/value shapes after the earlier transpose: [B, heads, seq, head_dim]
+                    q_prefix = query_states[:, :, :P, :]
+                    q_suffix = query_states[:, :, P:, :]
+
+                    # Prefix queries attend only to prefix K/V (mask already blocks suffix anyway).
+                    k_prefix = key_states[:, :, :P, :]
+                    v_prefix = value_states[:, :, :P, :]
+                    mask_p = attention_mask[:, :, :P, :P]
+
+                    # Suffix queries attend to [detach(prefix), suffix].
+                    k_suffix_view = torch.cat(
+                        [key_states[:, :, :P, :].detach(), key_states[:, :, P:, :]], dim=2
+                    )
+                    v_suffix_view = torch.cat(
+                        [value_states[:, :, :P, :].detach(), value_states[:, :, P:, :]], dim=2
+                    )
+                    mask_s = attention_mask[:, :, P:, :]
+
+                    att_prefix, _ = modeling_gemma.eager_attention_forward(
+                        llm_self_attn, q_prefix, k_prefix, v_prefix, mask_p, scaling,
+                    )
+                    att_suffix, _ = modeling_gemma.eager_attention_forward(
+                        llm_self_attn, q_suffix, k_suffix_view, v_suffix_view, mask_s, scaling,
+                    )
+                    att_output = torch.cat([att_prefix, att_suffix], dim=1)
+                else:
+                    att_output, _ = modeling_gemma.eager_attention_forward(
+                        llm_self_attn,
+                        query_states,
+                        key_states,
+                        value_states,
+                        attention_mask,
+                        scaling,
+                    )
                 # Get head_dim from the current layer, not from the model
                 head_dim = self.paligemma.language_model.layers[layer_idx].self_attn.head_dim
                 att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)

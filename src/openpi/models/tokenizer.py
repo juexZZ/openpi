@@ -49,8 +49,15 @@ class PaligemmaTokenizer:
 
 
 class FASTTokenizer:
-    def __init__(self, max_len: int = 256, fast_tokenizer_path: str = "physical-intelligence/fast"):
+    def __init__(
+        self,
+        max_len: int = 256,
+        fast_tokenizer_path: str = "physical-intelligence/fast",
+        *,
+        lowercase: bool = True,
+    ):
         self._max_len = max_len
+        self._lowercase = lowercase
 
         # Download base PaliGemma tokenizer
         path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
@@ -64,7 +71,9 @@ class FASTTokenizer:
     def tokenize(
         self, prompt: str, state: np.ndarray, actions: np.ndarray | None
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        cleaned_text = prompt.lower().strip().replace("_", " ")
+        cleaned_text = prompt.strip().replace("_", " ")
+        if self._lowercase:
+            cleaned_text = cleaned_text.lower()
 
         # Convention: state gets discretized into 256 discrete bins (assumed range after normalization: [-1, 1])
         discretized_state = np.digitize(state, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1

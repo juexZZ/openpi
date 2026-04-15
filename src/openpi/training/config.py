@@ -125,6 +125,19 @@ class ModelTransformFactory(GroupFactory):
                 )
             case _model.ModelType.PI05:
                 assert isinstance(model_config, pi0_config.Pi0Config)
+                if model_config.pi05_discrete_action_loss:
+                    # Auxiliary FAST-tokenized action CE loss: tokenize prompt, state AND action targets
+                    # into the language prefix. FASTTokenizer populates token_ar_mask / token_loss_mask.
+                    return _transforms.Group(
+                        inputs=[
+                            _transforms.InjectDefaultPrompt(self.default_prompt),
+                            _transforms.ResizeImages(224, 224),
+                            _transforms.TokenizeFASTInputs(
+                                _tokenizer.FASTTokenizer(model_config.max_token_len, lowercase=False),
+                            ),
+                            _transforms.PadStatesAndActions(model_config.action_dim),
+                        ],
+                    )
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),

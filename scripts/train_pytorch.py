@@ -527,13 +527,25 @@ def train_loop(config: _config.TrainConfig):
 
             # Forward pass
             losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
-
-            loss = losses.mean()
+            # The pi0.5 discrete-action-loss path returns a dict with separate 'mse', 'ce', and
+            # 'total' entries. All other paths return a tensor of per-sample losses.
+            loss_components: dict[str, float] = {}
+            if isinstance(losses, dict):
+                loss = losses["total"]
+                if "mse" in losses:
+                    loss_components["mse_loss"] = (
+                        losses["mse"].mean().item() if torch.is_tensor(losses["mse"]) else float(losses["mse"])
+                    )
+                if "ce" in losses:
+                    loss_components["ce_loss"] = (
+                        losses["ce"].item() if torch.is_tensor(losses["ce"]) else float(losses["ce"])
+                    )
+            else:
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
+                loss = losses.mean()
 
             # Backward pass
             loss.backward()
@@ -562,6 +574,7 @@ def train_loop(config: _config.TrainConfig):
                         "loss": loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                        **loss_components,
                     }
                 )
 
@@ -595,6 +608,10 @@ def train_loop(config: _config.TrainConfig):
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    for extra_key in ("mse_loss", "ce_loss"):
+                        extra_vals = [info[extra_key] for info in infos if extra_key in info]
+                        if extra_vals:
+                            log_payload[extra_key] = sum(extra_vals) / len(extra_vals)
                     wandb.log(log_payload, step=global_step)
 
                 start_time = time.time()
